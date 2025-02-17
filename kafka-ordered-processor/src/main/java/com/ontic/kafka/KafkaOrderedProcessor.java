@@ -9,6 +9,7 @@ import org.apache.kafka.common.errors.WakeupException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
@@ -71,55 +72,78 @@ public class KafkaOrderedProcessor<K, V> extends Thread {
                 }
             }
         });
-        try {
-            while (true) {
-                try {
-                    ConsumerRecords<K, V> records = this.consumer.poll(kafkaConfig.getPollTimeout());
-                    long expectedCompletionTime = System.currentTimeMillis() + kafkaConfig.getMaxMessageProcessingTime().toMillis();
-                    for (ConsumerRecord<K, V> record : records) {
-                        RecordWithStatus<K, V> message = new RecordWithStatus<>(record, expectedCompletionTime);
-                        boolean queueCreated = this.orderedQueue.enqueueMessage(record.key(), message);
-                        if (queueCreated) {
-                            offsetTracker.enqueue(message);
-                            executor.submit(new KeyedOrderedDelegator<>(record.key(), orderedQueue, recordWithStatus -> {
-                                try {
-                                    long startTime = System.nanoTime();
+        while (true) {
+            try {
+                ConsumerRecords<K, V> records = this.consumer.poll(kafkaConfig.getPollTimeout());
+                long expectedCompletionTime = System.currentTimeMillis() + kafkaConfig.getMaxMessageProcessingTime().toMillis();
+                for (ConsumerRecord<K, V> record : records) {
+                    RecordWithStatus<K, V> message = new RecordWithStatus<>(record, expectedCompletionTime);
+                    offsetTracker.enqueue(message);
+                    boolean queueCreated = this.orderedQueue.enqueueMessage(record.key(), message);
+                    if (queueCreated) {
+                        executor.submit(new KeyedOrderedDelegator<>(record.key(), orderedQueue, recordWithStatus -> {
+                            try {
+                                long startTime = System.nanoTime();
 
-                                    messageHandler.accept(recordWithStatus.getRecord().value());
+                                messageHandler.accept(recordWithStatus.getRecord().value());
 
-                                    messagesProcessed.increment();
+                                messagesProcessed.increment();
 
-                                    long duration = System.nanoTime() - startTime;
-                                    messagesProcessTimer.record(duration, TimeUnit.NANOSECONDS);
-                                } catch (Throwable t) {
-                                    messagesFailed.increment();
-                                    logger.error("Error while processing record", t);
-                                }
+                                long duration = System.nanoTime() - startTime;
+                                messagesProcessTimer.record(duration, TimeUnit.NANOSECONDS);
+                            } catch (Throwable t) {
+                                messagesFailed.increment();
+                                logger.error("Error while processing record", t);
+                            } finally {
                                 recordWithStatus.markCompleted();
-                            }));
-                        }
+                            }
+                        }));
                     }
-                    Map<TopicPartition, OffsetAndMetadata> committableOffsets = offsetTracker.getCommittableOffsets();
-                    if (!committableOffsets.isEmpty()) {
-                        this.consumer.commitSync(committableOffsets);
-                    }
-                } catch (WakeupException e) {
-                    if (logger.isInfoEnabled()) {
-                        logger.info("WakeupException occurred while polling records, shutting down.");
-                    }
-                    break;
-                } catch (Throwable t) {
-                    logger.error("Unexpected error occurred while polling records", t);
                 }
+                Map<TopicPartition, OffsetAndMetadata> committableOffsets = offsetTracker.getCommittableOffsets();
+                if (!committableOffsets.isEmpty()) {
+                    this.consumer.commitSync(committableOffsets);
+                }
+                while (orderedQueue.messagesInQueue() > kafkaConfig.getMaxQueuedMessages()) {
+                    try {
+                        if (logger.isWarnEnabled()) {
+                            logger.warn("Max number of messages is in queue: {}, sleeping for a sec", orderedQueue.messagesInQueue());
+                        }
+                        //noinspection BusyWait
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            } catch (WakeupException e) {
+                if (logger.isInfoEnabled()) {
+                    logger.info("WakeupException occurred while polling records, shutting down.");
+                }
+                break;
+            } catch (Throwable t) {
+                logger.error("Unexpected error occurred while polling records, continuing...", t);
             }
-        } finally {
-            this.consumer.close();
         }
     }
 
-    public void shutdown() {
-        if (this.consumer != null) {
+    public void shutdown(Duration timeout) throws InterruptedException {
+        if (this.consumer == null) {
+            return;
+        }
+        try {
             this.consumer.wakeup();
+            this.executor.shutdown();
+            boolean terminated = this.executor.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            if (!terminated) {
+                logger.error("Message Processor failed to terminate properly, some message may not have processed");
+            }
+            this.join(timeout.toMillis());
+        } finally {
+            Map<TopicPartition, OffsetAndMetadata> committableOffsets = offsetTracker.getCommittableOffsets();
+            if (!committableOffsets.isEmpty()) {
+                this.consumer.commitSync(committableOffsets);
+            }
+            this.consumer.close();
         }
     }
 

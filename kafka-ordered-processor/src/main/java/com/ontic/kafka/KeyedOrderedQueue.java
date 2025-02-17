@@ -1,22 +1,20 @@
 package com.ontic.kafka;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.util.LinkedList;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * @author rajesh
  * @since 13/02/25 12:00
  */
 public class KeyedOrderedQueue<K, V> {
-    private static final Logger logger = LoggerFactory.getLogger(KeyedOrderedQueue.class);
 
     private final ConcurrentHashMap<K, Queue<V>> queues;
-    private int messagesInQueue = 0;
+    private final AtomicInteger messagesInQueue = new AtomicInteger(0);
 
     public KeyedOrderedQueue(int capacity) {
         this.queues = new ConcurrentHashMap<>(capacity);
@@ -37,9 +35,9 @@ public class KeyedOrderedQueue<K, V> {
                 added.set(true);
             }
             vs.add(message);
+            messagesInQueue.incrementAndGet();
             return vs;
         });
-        messagesInQueue++;
         return added.get();
     }
 
@@ -52,48 +50,17 @@ public class KeyedOrderedQueue<K, V> {
      * @return the dequeued message, null if not message available
      */
     public V dequeueMessage(K key) {
-        Queue<V> queue = queues.get(key);
-        if (queue == null) {
-            logger.error("Should not happen, unless same key [ {} ] is being used in multiple thread", key);
-            return null;
-        }
-        V message = queue.poll();
-        if (message == null) {
-            if (logger.isDebugEnabled()) {
-                logger.debug("Queue for key [ {} ] is empty, removing it", key);
-            }
-            boolean removed = removeIfEmpty(key);
-            if (removed) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("Queue for key [ {} ] removed", key);
-                }
-                return null;
-            } else {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("Queue not removed some other message for key [ {} ] arrived in meantime", key);
-                }
-                return dequeueMessage(key);
-            }
-        }
-        messagesInQueue--;
-        return message;
-    }
-
-    /**
-     * Returns true if removed else false. Checks if queue against key is empty then remove it otherwise leave as it is.
-     *
-     * @param key to remove
-     * @return true if removed else false
-     */
-    private boolean removeIfEmpty(K key) {
-        Queue<V> computed = queues.compute(key, (k, vs) -> {
+        AtomicReference<V> removed = new AtomicReference<>(null);
+        queues.compute(key, (k, vs) -> {
             if (vs == null || vs.isEmpty()) {
                 return null;
-            } else {
-                return vs;
             }
+            V message = vs.poll();
+            removed.set(message);
+            messagesInQueue.decrementAndGet();
+            return vs;
         });
-        return computed == null;
+        return removed.get();
     }
 
     /**
@@ -102,6 +69,6 @@ public class KeyedOrderedQueue<K, V> {
      * @return Current number of message in across all queues
      */
     public int messagesInQueue() {
-        return messagesInQueue;
+        return messagesInQueue.get();
     }
 }

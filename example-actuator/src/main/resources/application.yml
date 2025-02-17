@@ -1,0 +1,17 @@
+ontic:
+  kafka:
+    topic: KafkaOrderedProcessorTestTopic
+    bootstrapServers: localhost:9092
+    groupId: TestGroup
+    groupInstanceId: InstanceId
+    pollTimeout: 60s
+    maxQueuedMessages: 10000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+  endpoint:
+    health:
+      show-details: always

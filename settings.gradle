@@ -1,5 +1,4 @@
 rootProject.name = 'kafka-partitioned-executor'
 include 'kafka-ordered-processor'
-include 'kafka-example-consumer'
-include 'kafka-example-producer'
+include 'example-actuator'
 
